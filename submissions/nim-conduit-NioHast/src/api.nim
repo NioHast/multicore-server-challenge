@@ -499,11 +499,15 @@ WITH page AS MATERIALIZED (
     let a = authUser(req, ctx, true)
     if not a.ok: replyError(req, Http401, "unauthorized")
     let slug = decodeUrl(path["/api/articles/".len .. ^1])
-    var q = ctx.db.execParams("SELECT id,author_id FROM articles WHERE slug=$1", [value(slug)])
+    var q = ctx.db.execParams("""
+WITH target AS (SELECT id,author_id FROM articles WHERE slug=$1),
+     del AS (DELETE FROM articles WHERE id=(SELECT id FROM target)
+             AND author_id=$2 RETURNING 1)
+SELECT (SELECT author_id FROM target) AS author_id,
+       EXISTS(SELECT 1 FROM del) AS deleted""", [value(slug), value($a.userId)])
     defer: q.close()
-    if q.rowCount == 0: replyError(req, Http404, "not found")
-    if int64(parseBiggestInt(q.get(0, 1))) != a.userId: replyError(req, Http403, "forbidden")
-    ctx.db.execParams("DELETE FROM articles WHERE id=$1", [value(q.get(0, 0))]).close()
+    if q.isNull(0, 0): replyError(req, Http404, "not found")
+    if int64(parseBiggestInt(q.get(0, 0))) != a.userId: replyError(req, Http403, "forbidden")
     await req.respond(Http204, "")
     return
 
@@ -512,34 +516,26 @@ WITH page AS MATERIALIZED (
     let slug = decodeUrl(path["/api/articles/".len .. ^(len("/comments") + 1)])
     let a = authUser(req, ctx, false)
     if not a.ok: replyError(req, Http401, "unauthorized")
-    var commentBody = ""
+
     if meth == HttpPost:
       let a2 = authUser(req, ctx, true)
       if not a2.ok: replyError(req, Http401, "unauthorized")
       let j = bodyJson(req)
       let c = if j != nil and j.kind == JObject: j{"comment"} else: nil
       if c == nil or not nonEmpty(c, "body"): replyError(req, Http422, "invalid comment")
-      commentBody = textField(c, "body")
-    var aq = ctx.db.execParams("SELECT id FROM articles WHERE slug=$1", [value(slug)])
-    defer: aq.close()
-    if aq.rowCount == 0: replyError(req, Http404, "not found")
-    let articleId = aq.get(0, 0)
-    if meth == HttpGet:
       var q = ctx.db.execParams("""
-SELECT c.id,to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-       to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),c.body,
-       u.username,u.bio,u.image,
-       EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=$1 AND fo.followee_id=c.author_id)
-  FROM comments c JOIN users u ON u.id=c.author_id
- WHERE c.article_id=$2 ORDER BY c.created_at DESC,c.id DESC LIMIT 100""",
-        [value($a.userId), value(articleId)])
+WITH target AS (SELECT id FROM articles WHERE slug=$1),
+     ins AS (INSERT INTO comments(article_id,author_id,body)
+             SELECT id,$2,$3 FROM target
+             RETURNING id,created_at,updated_at,body,author_id)
+SELECT c.id,
+       to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+       to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+       c.body,u.username,u.bio,u.image
+  FROM ins c JOIN users u ON u.id=c.author_id""",
+        [value(slug), value($a2.userId), value(textField(c, "body"))])
       defer: q.close()
-      var arr = newJArray()
-      for r in 0 ..< q.rowCount: arr.add commentNode(q, r)
-      replyJson(req, Http200, %*{"comments": arr})
-    if meth == HttpPost:
-      var q = ctx.db.execParams("INSERT INTO comments(article_id,author_id,body) VALUES($1,$2,$3) RETURNING id,to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),body,(SELECT username FROM users WHERE id=$2),(SELECT bio FROM users WHERE id=$2),(SELECT image FROM users WHERE id=$2)", [value(articleId), value($a.userId), value(commentBody)])
-      defer: q.close()
+      if q.rowCount == 0: replyError(req, Http404, "not found")
       var node = newJObject()
       node["id"] = %parseInt(q.get(0, 0))
       node["createdAt"] = %q.get(0, 1)
@@ -548,10 +544,26 @@ SELECT c.id,to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"
       node["author"] = profileNode(q.get(0, 4), q.get(0, 5), q.get(0, 6),
                                    q.isNull(0, 5), q.isNull(0, 6), false)
       replyJson(req, Http201, %*{"comment": node})
-    if meth == HttpDelete:
-      # /api/articles/:slug/comments/:id is handled below; this branch only
-      # protects against treating it as a collection operation.
-      discard
+
+    if meth == HttpGet:
+      var q = ctx.db.execParams("""
+WITH target AS (SELECT id FROM articles WHERE slug=$1)
+SELECT c.id,
+       to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+       to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+       c.body,u.username,u.bio,u.image,
+       EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=$2 AND fo.followee_id=c.author_id)
+  FROM target t
+  LEFT JOIN comments c ON c.article_id=t.id
+  LEFT JOIN users u ON u.id=c.author_id
+ ORDER BY c.created_at DESC,c.id DESC LIMIT 100""",
+        [value(slug), value($a.userId)])
+      defer: q.close()
+      if q.rowCount == 0: replyError(req, Http404, "not found")
+      var arr = newJArray()
+      if not q.isNull(0, 0):
+        for r in 0 ..< q.rowCount: arr.add commentNode(q, r)
+      replyJson(req, Http200, %*{"comments": arr})
 
   if path.startsWith("/api/articles/") and path.contains("/comments/"):
     let a = authUser(req, ctx, true)
@@ -561,11 +573,17 @@ SELECT c.id,to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"
     var cid: int64
     try: cid = int64(parseBiggestInt(chunks[5]))
     except ValueError: replyError(req, Http404, "not found")
-    var q = ctx.db.execParams("SELECT c.author_id FROM comments c JOIN articles a ON a.id=c.article_id WHERE c.id=$1 AND a.slug=$2", [value($cid), value(slug)])
+    var q = ctx.db.execParams("""
+WITH target AS (SELECT c.author_id FROM comments c
+                JOIN articles a ON a.id=c.article_id
+                WHERE c.id=$1 AND a.slug=$2),
+     del AS (DELETE FROM comments WHERE id=$1
+             AND EXISTS(SELECT 1 FROM target WHERE author_id=$3) RETURNING 1)
+SELECT (SELECT author_id FROM target) AS author_id,
+       EXISTS(SELECT 1 FROM del) AS deleted""", [value($cid), value(slug), value($a.userId)])
     defer: q.close()
-    if q.rowCount == 0: replyError(req, Http404, "not found")
+    if q.isNull(0, 0): replyError(req, Http404, "not found")
     if int64(parseBiggestInt(q.get(0, 0))) != a.userId: replyError(req, Http403, "forbidden")
-    ctx.db.execParams("DELETE FROM comments WHERE id=$1", [value($cid)]).close()
     await req.respond(Http204, "")
     return
 
@@ -574,16 +592,29 @@ SELECT c.id,to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"
     let a = authUser(req, ctx, true)
     if not a.ok: replyError(req, Http401, "unauthorized")
     let slug = decodeUrl(path["/api/articles/".len .. ^(len("/favorite") + 1)])
-    var q = ctx.db.execParams("SELECT id FROM articles WHERE slug=$1", [value(slug)])
-    defer: q.close()
-    if q.rowCount == 0: replyError(req, Http404, "not found")
+    # Read the article before the write, then adjust the two fields the write
+    # changes. This saves one round trip compared with read/write/read.
+    var q = ctx.db.execParams(ArticleFullSelect & " WHERE a.slug=$2",
+                              [value($a.userId), value(slug)])
+    if q.rowCount == 0:
+      q.close()
+      replyError(req, Http404, "not found")
+    let node = articleNode(q, 0, true)
     let aid = q.get(0, 0)
+    let wasFavorited = node["favorited"].getBool
+    q.close()
     if meth == HttpPost:
       ctx.db.execParams("INSERT INTO favorites(user_id,article_id) VALUES($1,$2) ON CONFLICT DO NOTHING", [value($a.userId), value(aid)]).close()
+      if not wasFavorited:
+        node["favorited"] = %true
+        node["favoritesCount"] = %(node["favoritesCount"].getInt + 1)
     elif meth == HttpDelete:
       ctx.db.execParams("DELETE FROM favorites WHERE user_id=$1 AND article_id=$2", [value($a.userId), value(aid)]).close()
+      if wasFavorited:
+        node["favorited"] = %false
+        node["favoritesCount"] = %(node["favoritesCount"].getInt - 1)
     else: replyError(req, Http404, "not found")
-    await sendArticleBySlug(req, ctx, a.userId, slug, true)
+    replyJson(req, Http200, %*{"article": node})
 
   replyError(req, Http404, "not found")
 
