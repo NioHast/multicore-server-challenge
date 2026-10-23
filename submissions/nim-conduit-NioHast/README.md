@@ -46,3 +46,20 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
 JWT_SECRET=multicore-server-challenge HOST=0.0.0.0 PORT=80 bash start.sh
 ```
+
+## Validation
+
+- `197/197` conformance checks on the 2% dev seed and on the full 2.35 GB seed.
+- A small local load smoke (2,000 users, 4-vCPU machine, load generator on the
+  same host) completed with zero errors and p95/p99 comfortably below the
+  limits; the local generator itself was CPU-limited, so this is not an
+  official capacity claim.
+- The official 8-vCPU box has not been available for this submission.
+
+## Known trade-offs
+
+The request path uses synchronous libpq calls; concurrency comes from multiple
+worker processes (32 PostgreSQL connections on the 8-vCPU box) rather than an
+async PostgreSQL pipeline. bcrypt runs synchronously inside a worker, so a
+login can delay only that worker. These are deliberate correctness-first
+choices and the main areas for future optimization.

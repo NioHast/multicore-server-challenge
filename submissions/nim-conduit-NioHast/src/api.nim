@@ -207,6 +207,8 @@ proc sendArticleBySlug(req: Request; ctx: ApiCtx; viewer: int64;
   replyJson(req, Http200, %*{"article": articleNode(q, 0, includeBody)})
 
 proc handleImpl(req: Request; ctx: ApiCtx) {.async.} =
+  # Routing is intentionally linear: the 19 Conduit endpoints are few enough
+  # that a table would add indirection without improving clarity.
   let path = req.url.path
   let meth = req.reqMethod
 
@@ -220,6 +222,7 @@ proc handleImpl(req: Request; ctx: ApiCtx) {.async.} =
     await req.respond(Http200, body, newHttpHeaders(JsonHeaders))
     return
 
+  # --- users and authentication -------------------------------------------
   if meth == HttpPost and path == "/api/users":
     let j = bodyJson(req)
     let u = if j != nil and j.kind == JObject: j{"user"} else: nil
@@ -301,6 +304,7 @@ proc handleImpl(req: Request; ctx: ApiCtx) {.async.} =
     replyJson(req, Http200, %*{"user": userNode(a.userId, q.get(0, 1), q.get(0, 2),
       q.get(0, 3), q.get(0, 4), q.isNull(0, 3), q.isNull(0, 4), token)})
 
+  # --- profiles and follows ------------------------------------------------
   if path.startsWith("/api/profiles/"):
     let parts = path.split('/')
     if parts.len == 4 and meth == HttpGet:
@@ -330,6 +334,7 @@ proc handleImpl(req: Request; ctx: ApiCtx) {.async.} =
       replyJson(req, Http200, %*{"profile": profileNode(q.get(0, 1), q.get(0, 2),
         q.get(0, 3), q.isNull(0, 2), q.isNull(0, 3), meth == HttpPost)})
 
+  # --- article lists, feeds and CRUD --------------------------------------
   if meth == HttpGet and path == "/api/articles":
     let a = authUser(req, ctx, false)
     if not a.ok: replyError(req, Http401, "unauthorized")
@@ -498,6 +503,7 @@ WITH page AS MATERIALIZED (
     await req.respond(Http204, "")
     return
 
+  # --- comments -------------------------------------------------------------
   if path.startsWith("/api/articles/") and path.endsWith("/comments"):
     let slug = decodeUrl(path["/api/articles/".len .. ^(len("/comments") + 1)])
     let a = authUser(req, ctx, false)
@@ -559,6 +565,7 @@ SELECT c.id,to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"
     await req.respond(Http204, "")
     return
 
+  # --- favorites ------------------------------------------------------------
   if path.startsWith("/api/articles/") and (path.endsWith("/favorite")):
     let a = authUser(req, ctx, true)
     if not a.ok: replyError(req, Http401, "unauthorized")
