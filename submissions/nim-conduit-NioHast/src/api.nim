@@ -320,19 +320,23 @@ proc handleImpl(req: Request; ctx: ApiCtx) {.async.} =
     if parts.len == 5 and parts[4] == "follow" and meth in {HttpPost, HttpDelete}:
       let a = authUser(req, ctx, true)
       if not a.ok: replyError(req, Http401, "unauthorized")
-      var q = ctx.db.execParams("SELECT id,username,bio,image FROM users WHERE username=$1",
-                                [value(decodeUrl(parts[3]))])
+      let followSql =
+        if meth == HttpPost:
+          """WITH target AS (SELECT id,username,bio,image FROM users WHERE username=$2),
+                 ins AS (INSERT INTO follows(follower_id,followee_id)
+                         SELECT $1,id FROM target ON CONFLICT DO NOTHING)
+             SELECT username,bio,image FROM target"""
+        else:
+          """WITH target AS (SELECT id,username,bio,image FROM users WHERE username=$2),
+                 del AS (DELETE FROM follows WHERE follower_id=$1
+                         AND followee_id=(SELECT id FROM target))
+             SELECT username,bio,image FROM target"""
+      var q = ctx.db.execParams(followSql,
+                                [value($a.userId), value(decodeUrl(parts[3]))])
       defer: q.close()
       if q.rowCount == 0: replyError(req, Http404, "not found")
-      let target = int64(parseBiggestInt(q.get(0, 0)))
-      if meth == HttpPost:
-        ctx.db.execParams("INSERT INTO follows(follower_id,followee_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
-                          [value($a.userId), value($target)]).close()
-      else:
-        ctx.db.execParams("DELETE FROM follows WHERE follower_id=$1 AND followee_id=$2",
-                          [value($a.userId), value($target)]).close()
-      replyJson(req, Http200, %*{"profile": profileNode(q.get(0, 1), q.get(0, 2),
-        q.get(0, 3), q.isNull(0, 2), q.isNull(0, 3), meth == HttpPost)})
+      replyJson(req, Http200, %*{"profile": profileNode(q.get(0, 0), q.get(0, 1),
+        q.get(0, 2), q.isNull(0, 1), q.isNull(0, 2), meth == HttpPost)})
 
   # --- article lists, feeds and CRUD --------------------------------------
   if meth == HttpGet and path == "/api/articles":
